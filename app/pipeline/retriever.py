@@ -17,6 +17,7 @@ on which embedding model actually produces the vectors:
   touching this file.
 """
 import json
+import time
 from pathlib import Path
 from typing import Protocol
 
@@ -107,11 +108,24 @@ class GeminiEmbedder:
     Uses the batchEmbedContents endpoint (chunked to respect a conservative
     per-request batch size) for building the offline index, and encode()
     with a single text for live queries at request time.
+
+    RATE LIMIT NOTE: the free tier enforces a requests-per-minute cap
+    (exact number varies by account/region and Google does not treat it as
+    a stable published guarantee -- see APPROACH.md). Since
+    batchEmbedContents counts as ONE request regardless of how many texts
+    are packed into it, BATCH_SIZE is set high (100, the API's documented
+    per-request cap) to minimize the total number of requests made when
+    building the index, and _embed_batch retries with exponential backoff
+    on 429 responses rather than assuming a specific RPM number.
     """
 
     MODEL_NAME = "models/gemini-embedding-001"
     OUTPUT_DIM = 768
-    BATCH_SIZE = 50  # conservative chunk size for batchEmbedContents
+    BATCH_SIZE = 100  # batchEmbedContents' documented per-request limit --
+    # larger batches mean FEWER total requests, which is what actually
+    # matters for a per-minute request-count rate limit.
+    MAX_RETRIES = 6
+    INITIAL_BACKOFF_SECONDS = 5
 
     def __init__(self, api_key: str = None):
         self.api_key = api_key or config.GEMINI_API_KEY
@@ -135,18 +149,46 @@ class GeminiEmbedder:
             }
             for t in texts
         ]
-        resp = requests.post(
-            url, json={"requests": requests_payload}, timeout=config.LLM_TIMEOUT_SECONDS
+
+        backoff = self.INITIAL_BACKOFF_SECONDS
+        last_error = None
+        for attempt in range(self.MAX_RETRIES):
+            resp = requests.post(
+                url, json={"requests": requests_payload}, timeout=config.LLM_TIMEOUT_SECONDS
+            )
+            if resp.status_code == 429:
+                # Respect a Retry-After header if the API sends one,
+                # otherwise fall back to exponential backoff. This is
+                # deliberately not hardcoded to a specific RPM number --
+                # free-tier limits vary by account/region and Google's own
+                # docs don't treat them as a stable guarantee.
+                retry_after = resp.headers.get("Retry-After")
+                wait_seconds = float(retry_after) if retry_after else backoff
+                last_error = f"429 rate limited (attempt {attempt + 1}/{self.MAX_RETRIES})"
+                print(f"{last_error}, waiting {wait_seconds:.0f}s before retrying...")
+                time.sleep(wait_seconds)
+                backoff *= 2
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            return [e["values"] for e in data["embeddings"]]
+
+        raise RuntimeError(
+            f"Gemini embeddings still rate-limited after {self.MAX_RETRIES} retries: {last_error}"
         )
-        resp.raise_for_status()
-        data = resp.json()
-        return [e["values"] for e in data["embeddings"]]
 
     def encode(self, texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT") -> np.ndarray:
         all_vectors: list[list[float]] = []
-        for i in range(0, len(texts), self.BATCH_SIZE):
+        num_batches = (len(texts) + self.BATCH_SIZE - 1) // self.BATCH_SIZE
+        for batch_num, i in enumerate(range(0, len(texts), self.BATCH_SIZE)):
             chunk = texts[i : i + self.BATCH_SIZE]
             all_vectors.extend(self._embed_batch(chunk, task_type))
+            # Small proactive pause between batches (not just reactive
+            # retry-on-429) so a multi-batch index build doesn't burst
+            # requests right up against the rate limit in the first place.
+            # Skipped after the final batch.
+            if batch_num < num_batches - 1:
+                time.sleep(2)
 
         arr = np.array(all_vectors, dtype="float32")
         # Normalize for cosine similarity via inner product, matching
