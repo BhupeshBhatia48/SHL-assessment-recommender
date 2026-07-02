@@ -32,7 +32,16 @@ Design decisions that DON'T change with the embedder swap:
   ordered list of catalog record `id`s matching the index's row order).
 """
 import json
+import sys
 from pathlib import Path
+
+# Ensure the project root (parent of this scripts/ folder) is importable as
+# `app.*` regardless of how this script is invoked. Running `python
+# scripts/build_index.py` only puts scripts/ itself on sys.path by default,
+# not the project root -- this line is what makes `from app.pipeline...`
+# work whether you run this from the project root, from inside scripts/, or
+# as part of a platform build command (e.g. Render's buildCommand).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import faiss
 
