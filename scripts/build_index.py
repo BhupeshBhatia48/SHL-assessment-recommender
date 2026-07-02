@@ -1,7 +1,7 @@
 """
 Builds a FAISS similarity index over app/data/catalog.json.
 
-EMBEDDING BACKEND: uses GeminiEmbedder (hosted API, text-embedding-004) by
+EMBEDDING BACKEND: uses GeminiEmbedder (hosted API, gemini-embedding-001) by
 default, NOT the local sentence-transformers model. This was a deliberate
 pivot: the original design used a local PyTorch-based model, which works
 fine for local dev but exceeded the 512MB memory ceiling on Render's free
@@ -71,7 +71,7 @@ def main():
     texts = [build_embedding_text(r) for r in catalog]
     ids = [r["id"] for r in catalog]
 
-    print("Embedding catalog via Gemini text-embedding-004 API...")
+    print("Embedding catalog via Gemini gemini-embedding-001 API...")
     embedder = GeminiEmbedder()
     embeddings = embedder.encode(texts)
 
