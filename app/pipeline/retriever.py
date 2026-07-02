@@ -33,8 +33,12 @@ IDS_PATH = DATA_DIR / "catalog_ids.json"
 
 
 class Embedder(Protocol):
-    def encode(self, texts: list[str]) -> np.ndarray:
-        """Return an (N, dim) float32 array of L2-normalized embeddings."""
+    def encode(self, texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT") -> np.ndarray:
+        """Return an (N, dim) float32 array of L2-normalized embeddings.
+        task_type distinguishes documents being indexed from live queries
+        for backends that support asymmetric retrieval embeddings (see
+        GeminiEmbedder); backends that don't support this distinction (e.g.
+        SentenceTransformerEmbedder) simply ignore the parameter."""
         ...
 
 
@@ -56,14 +60,16 @@ class SentenceTransformerEmbedder:
 
         self.model = SentenceTransformer(self.MODEL_NAME)
 
-    def encode(self, texts: list[str]) -> np.ndarray:
+    def encode(self, texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT") -> np.ndarray:
+        # task_type is part of the shared Embedder interface but this model
+        # doesn't support asymmetric query/document embeddings -- ignored.
         return self.model.encode(
             texts, convert_to_numpy=True, normalize_embeddings=True
         ).astype("float32")
 
 
 class GeminiEmbedder:
-    """Embedding backend using Google's hosted text-embedding-004 model via
+    """Embedding backend using Google's hosted gemini-embedding-001 model via
     REST API instead of a locally-loaded PyTorch model.
 
     WHY THIS EXISTS: the original design used SentenceTransformerEmbedder
@@ -75,19 +81,37 @@ class GeminiEmbedder:
     same GEMINI_API_KEY already required for the chat LLM calls, and
     requires zero changes anywhere else in the pipeline because retrieval
     logic was built against the Embedder protocol, not a specific backend.
-    This is a deliberate, evidence-driven trade-off worth being able to
-    explain in the interview: local embeddings are "free" in dollar terms
-    but not in memory, and free-tier hosting makes memory the actual
-    constraint that matters.
 
-    Uses the batchEmbedContents endpoint (chunked to respect the API's
-    per-request batch size limit) for building the offline index, and
-    embedContent for single live queries at request time.
+    MODEL NAME NOTE: this originally targeted "text-embedding-004", which
+    returned a 404 on batchEmbedContents when actually deployed -- that
+    model is legacy/deprecated. The current generally-available embedding
+    model is "gemini-embedding-001", which is what's used here. Caught via
+    a live deploy failure, not local testing (no internet to the real
+    endpoint was available during initial development -- see APPROACH.md).
+
+    DIMENSIONALITY NOTE: gemini-embedding-001 defaults to 3072 dimensions
+    unless explicitly truncated. We fix it to 768 (one of the officially
+    supported MRL sizes, alongside 1536/3072) explicitly on every request --
+    both to keep the FAISS index compact and because the dimension must be
+    IDENTICAL between whatever built the index and whatever embeds a live
+    query, so leaving it to an implicit default would be fragile.
+
+    TASK TYPE: Gemini's embedding model supports asymmetric retrieval task
+    types -- documents indexed with RETRIEVAL_DOCUMENT and queries embedded
+    with RETRIEVAL_QUERY are optimized differently for this exact
+    query-vs-document matching scenario, rather than treating both sides
+    symmetrically. encode() takes a task_type param so build_index.py (which
+    embeds catalog *documents*) and retriever.py's live search (which embeds
+    a *query*) each pass the correct one.
+
+    Uses the batchEmbedContents endpoint (chunked to respect a conservative
+    per-request batch size) for building the offline index, and encode()
+    with a single text for live queries at request time.
     """
 
-    MODEL_NAME = "models/text-embedding-004"
+    MODEL_NAME = "models/gemini-embedding-001"
     OUTPUT_DIM = 768
-    BATCH_SIZE = 100  # Gemini batchEmbedContents limit per request
+    BATCH_SIZE = 50  # conservative chunk size for batchEmbedContents
 
     def __init__(self, api_key: str = None):
         self.api_key = api_key or config.GEMINI_API_KEY
@@ -97,13 +121,19 @@ class GeminiEmbedder:
                 "even if LLM_PROVIDER=groq for chat completions)."
             )
 
-    def _embed_batch(self, texts: list[str]) -> list[list[float]]:
+    def _embed_batch(self, texts: list[str], task_type: str) -> list[list[float]]:
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/{self.MODEL_NAME}"
             f":batchEmbedContents?key={self.api_key}"
         )
         requests_payload = [
-            {"model": self.MODEL_NAME, "content": {"parts": [{"text": t}]}} for t in texts
+            {
+                "model": self.MODEL_NAME,
+                "content": {"parts": [{"text": t}]},
+                "taskType": task_type,
+                "outputDimensionality": self.OUTPUT_DIM,
+            }
+            for t in texts
         ]
         resp = requests.post(
             url, json={"requests": requests_payload}, timeout=config.LLM_TIMEOUT_SECONDS
@@ -112,16 +142,19 @@ class GeminiEmbedder:
         data = resp.json()
         return [e["values"] for e in data["embeddings"]]
 
-    def encode(self, texts: list[str]) -> np.ndarray:
+    def encode(self, texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT") -> np.ndarray:
         all_vectors: list[list[float]] = []
         for i in range(0, len(texts), self.BATCH_SIZE):
             chunk = texts[i : i + self.BATCH_SIZE]
-            all_vectors.extend(self._embed_batch(chunk))
+            all_vectors.extend(self._embed_batch(chunk, task_type))
 
         arr = np.array(all_vectors, dtype="float32")
         # Normalize for cosine similarity via inner product, matching
         # SentenceTransformerEmbedder's convention so IndexFlatIP behaves
         # identically regardless of which embedder built the index.
+        # gemini-embedding-001 embeddings are not pre-normalized when a
+        # non-default output_dimensionality is requested, so this step is
+        # required, not just a convention match.
         norms = np.linalg.norm(arr, axis=1, keepdims=True)
         norms[norms == 0] = 1.0
         return arr / norms
@@ -146,7 +179,10 @@ class CatalogRetriever:
         """Return up to top_k catalog records ranked by similarity to query."""
         if not query.strip():
             return []
-        query_vec = self.embedder.encode([query])
+        # RETRIEVAL_QUERY (vs. RETRIEVAL_DOCUMENT used when the catalog was
+        # indexed) matters for backends supporting asymmetric retrieval
+        # embeddings -- see GeminiEmbedder's docstring.
+        query_vec = self.embedder.encode([query], task_type="RETRIEVAL_QUERY")
         scores, indices = self.index.search(query_vec, min(top_k, len(self.ids)))
         results = []
         for score, idx in zip(scores[0], indices[0]):
