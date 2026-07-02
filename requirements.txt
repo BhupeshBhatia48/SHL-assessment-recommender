@@ -1,0 +1,23 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+requests==2.32.3
+faiss-cpu>=1.12.0
+beautifulsoup4==4.12.3
+numpy>=1.26.4
+python-dotenv==1.0.1
+
+# Optional, NOT installed by default: sentence-transformers (+ torch as a
+# transitive dependency) for the local SentenceTransformerEmbedder backend
+# in app/pipeline/retriever.py. Left out of the default install because
+# torch alone commonly exceeds the 512MB memory ceiling on free-tier hosts
+# (Render/Railway free plans) -- see GeminiEmbedder's docstring for why the
+# default backend is now a hosted API call instead. Uncomment below only if
+# you're self-hosting with more available memory and want to avoid
+# embedding-API calls/rate limits:
+# sentence-transformers==3.3.1
+
+# dev / testing only
+pytest==8.3.4
+httpx==0.28.1
+scikit-learn==1.5.2
